@@ -74,7 +74,7 @@ def test_cache_miss_falls_back_without_partial_reuse(setup_cache, change):
     if change == "id":
         k["TEXT_ENCODER_ID"] = "different-model"
     elif change == "spec":
-        k["TEXT_ENCODE"] = {**k["TEXT_ENCODE"], "dtype": "fp32"}
+        k["TEXT_ENCODE"] = {**k["TEXT_ENCODE"], "dtype": "fp16"}
     elif change == "storage":
         k["CACHE_DTYPE"] = "fp32"
     _, text, embeds = model.build_encoders(k, DEVICE, PrecisionConfig())

@@ -200,3 +200,29 @@ def test_different_model_is_not_overwritten(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="Refusing to replace"):
         exec(bootstrap.DOWNLOAD_MODELS, {})
     assert path.read_bytes() == b"user model"
+
+
+@pytest.mark.parametrize("source_match", [True, False])
+def test_dependency_check_uses_module_origin_without_direct_url(tmp_path, monkeypatch, capsys, source_match):
+    import importlib.metadata as md
+    from types import SimpleNamespace
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = []\n[project.optional-dependencies]\ncuda = []\n'
+    )
+    versions = {"torch": "2.13.0+cu130", "torchvision": "0.28.0+cu130", "huggingface_hub": "1.0"}
+    monkeypatch.setattr(md, "version", lambda name: versions[name])
+    monkeypatch.setattr(md, "distribution", lambda name: pytest.fail("direct_url is not required"))
+    original_find_spec = importlib.util.find_spec
+
+    def find_spec(name):
+        if name in ("kohakumoss", "kohakumoss_data"):
+            root = tmp_path if source_match else tmp_path / "other-project"
+            return SimpleNamespace(origin=str(root / "src" / name / "__init__.py"))
+        return original_find_spec(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(sys, "argv", ["dependency_check", str(tmp_path)])
+    exec(bootstrap.DEPENDENCY_CHECK, {})
+    state = json.loads(capsys.readouterr().out)
+    assert state == {"problems": [], "editable": source_match}

@@ -82,11 +82,11 @@ def prepare_source(project, commit):
 # self-referencing extras in the official pyproject instead of duplicating its list.
 DEPENDENCY_CHECK = r'''
 import importlib.metadata as md
+import importlib.util
 import json
 from pathlib import Path
 import sys
 import tomllib
-from urllib.parse import unquote, urlparse
 
 project = Path(sys.argv[1]).resolve()
 try:
@@ -126,12 +126,14 @@ for raw in requirements:
     else:
         if req.specifier and not req.specifier.contains(version, prereleases=True):
             problems.append(f"{req.name}=={version} does not satisfy {req.specifier}")
-try:
-    direct = json.loads(md.distribution("kohakumoss").read_text("direct_url.json") or "{}")
-except md.PackageNotFoundError:
-    direct = {}
-url = urlparse(direct.get("url", ""))
-editable = bool(direct.get("dir_info", {}).get("editable")) and url.scheme == "file" and Path(unquote(url.path)).resolve() == project
+# Some uv-installed editable distributions omit direct_url.json. Resolve the
+# actual modules without importing them; source paths are the relevant contract.
+editable = True
+for name in ("kohakumoss", "kohakumoss_data"):
+    module = importlib.util.find_spec(name)
+    expected = project / "src" / name / "__init__.py"
+    if module is None or not module.origin or Path(module.origin).resolve() != expected:
+        editable = False
 print(json.dumps({"problems": problems, "editable": editable}))
 '''
 
