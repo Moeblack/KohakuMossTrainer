@@ -1,8 +1,8 @@
 """CELL2's secret-free launcher for the pinned, single-GPU native trainer.
 
 No GPU/import/network work before complete explicit configuration. Checkpoint
-uploads are synchronous AFTER CheckpointManager.save returns (including exports),
-so failures stop training rather than allowing retention to delete unbacked state.
+save hooks only create protected local snapshots; a single durable-queue worker
+uploads them. Training success requires draining every backup, including export.
 """
 
 import argparse
@@ -15,8 +15,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import zipfile
+import uuid
 from pathlib import Path, PurePosixPath
 
 TRAINER_COMMIT = "05eb27299708ff553fbe53b2dbcf4cebf99e422a"
@@ -27,8 +29,55 @@ def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
+    fsync_dir(path.parent)
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def snapshot_file(source, destination):
+    """Independent inode: fast Linux CoW clone, reliable copy on other filesystems.
+
+    Never hardlink: same-step saves, metadata and sample sidecars may be rewritten.
+    The caller serializes the trainer save through the completed snapshot rename.
+    """
+    with open(source, "rb") as src, open(destination, "xb") as dst:
+        try:
+            fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())  # FICLONE
+        except OSError:
+            dst.seek(0)
+            dst.truncate()
+            shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.chmod(destination, 0o400)
+    return destination
+
+
+def snapshot_source(folder):
+    paths = sorted(folder.rglob("*"))
+    if folder.is_symlink() or any(p.is_symlink() for p in paths):
+        raise ValueError("Backup snapshots cannot contain symlinks")
+    source = []
+    for p in paths:
+        s = p.stat()
+        if stat.S_ISREG(s.st_mode):
+            source.append([str(p.relative_to(folder)), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns])
+        elif not stat.S_ISDIR(s.st_mode):
+            raise ValueError("Backup snapshots require regular files/directories")
+    if not source:
+        raise ValueError("Refusing an empty backup")
+    return source
 
 
 def missing_config(c):
@@ -60,6 +109,11 @@ def validate_config(c):
         raise ValueError("Sampling enabled without user-provided SAMPLE_PROMPTS")
     if k["STEPS"] <= 0 or k["SAVE_EVERY"] <= 0 or c["UPLOAD_ATTEMPTS"] < 1:
         raise ValueError("STEPS, SAVE_EVERY and UPLOAD_ATTEMPTS must be positive")
+    for key, default in (("BACKUP_MAX_PENDING", 8), ("BACKUP_MAX_BYTES", 32 * 1024**3)):
+        if not isinstance(c.get(key, default), int) or c.get(key, default) < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if c.get("BACKUP_MIN_FREE_BYTES", 2 * 1024**3) < 0 or c["UPLOAD_RETRY_SECONDS"] < 0:
+        raise ValueError("Backup free-space reserve and retry delay cannot be negative")
     return []
 
 
@@ -203,48 +257,287 @@ def file_digest(path):
 
 
 class Backups:
+    """One process/worker owns manifest writes; queued snapshots survive pruning/crash.
+
+    The queue has both byte and item limits. Exceeding either fails immediately,
+    never waits for the network. Only drain/close waits for an in-flight upload.
+    """
+
     def __init__(self, api, c, work):
-        self.api, self.c = api, c
-        self.manifest = Path(work) / "uploaded.json"
-        self.done = json.loads(self.manifest.read_text()) if self.manifest.exists() else {}
+        self.api, self.c = api, dict(c)
+        self.work = Path(work)
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.manifest = self.work / "uploaded.json"
+        self.spool = self.work / "backup-queue"
+        self.spool.mkdir(mode=0o700, exist_ok=True)
+        self.lock = (self.work / ".backup.lock").open("a+")
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            self.lock.close()
+            raise RuntimeError("Another backup worker owns this run") from None
+        self.condition = threading.Condition()
+        self.producer_lock = threading.RLock()
+        self.stop = threading.Event()
+        self.closed = False
+        self.error = None
+        self.jobs = {}
+        self.last_source = {}
+        try:
+            self.done = json.loads(self.manifest.read_text()) if self.manifest.exists() else {}
+            for key, entry in self.done.items():
+                self.last_source[key] = entry.get("source")
+            # A ready directory carries its own write-ahead descriptor: recover
+            # even if the process died before pending.json could be updated.
+            for folder in sorted(self.spool.iterdir()):
+                job = json.loads((folder / "job.json").read_text())
+                if job["id"] != folder.name.removesuffix(".partial") or job["repo"] != c["OUTPUT_REPO"]:
+                    raise RuntimeError("UNBACKED: pending backup identity differs; retain this run's original OUTPUT_REPO")
+                safe_relative(job["remote"])
+                if folder.name.endswith(".partial"):
+                    self._snapshot(job, folder)
+                    folder = self.spool / job["id"]
+                if job["state"] == "succeeded" or self.done.get(self._key(job), {}).get("source") == job["source"]:
+                    shutil.rmtree(folder)
+                    continue
+                if not (folder / "files").is_dir():
+                    raise RuntimeError("UNBACKED: pending snapshot is missing")
+                job.update(state="queued", attempt=0)
+                self.jobs[job["id"]] = job
+                self.last_source[self._key(job)] = job["source"]
+                atomic_json(folder / "job.json", job)
+            self._persist()
+        except BaseException:
+            self.lock.close()
+            raise
+        self.thread = threading.Thread(target=self._worker, name="checkpoint-backups", daemon=False)
+        self.thread.start()
+
+    def _snapshot(self, job, partial):
+        if job["state"] == "snapshotting":
+            source = Path(job["source_path"])
+            if snapshot_source(source) != job["source"]:
+                raise RuntimeError("UNBACKED: interrupted snapshot source changed; retain backup-queue and recover complete original state")
+            if (partial / "files").exists():
+                shutil.rmtree(partial / "files")
+            shutil.copytree(source, partial / "files", copy_function=snapshot_file)
+            for directory in sorted((partial / "files").rglob("*"), reverse=True):
+                if directory.is_dir():
+                    fsync_dir(directory)
+            fsync_dir(partial / "files")
+            job["state"] = "queued"
+            atomic_json(partial / "job.json", job)
+        fsync_dir(partial)
+        partial.rename(self.spool / job["id"])
+        fsync_dir(self.spool)
+
+    def _key(self, job):
+        return job["repo"] + "/" + job["remote"]
+
+    def _pending(self):
+        return [j for j in self.jobs.values() if j["state"] != "succeeded"]
+
+    def _persist(self):
+        pending = self._pending()
+        atomic_json(self.work / "pending.json", {"version": 1, "jobs": pending})
+        atomic_json(self.work / "backup-status.json", {
+            "pending": len(pending), "pending_bytes": sum(j["bytes"] for j in pending),
+            "unbacked": bool(pending) or self.error is not None,
+            "error": self.error, "jobs": [{k: j[k] for k in ("id", "remote", "state", "attempt")} for j in self.jobs.values()],
+        })
+
+    def _state(self, job, state, **extra):
+        job.update(state=state, **extra)
+        atomic_json(self.spool / job["id"] / "job.json", job)
+        self._persist()
+        self.condition.notify_all()
+
+    def check(self):
+        with self.condition:
+            if self.error:
+                raise RuntimeError(self.error)
+            if self.closed:
+                raise RuntimeError("Backup queue is closed")
 
     def upload(self, folder, remote_path):
-        folder = Path(folder)
-        files = sorted(p for p in folder.rglob("*") if p.is_file())
-        if not files:
-            raise ValueError("Refusing an empty backup")
-        signature = {str(p.relative_to(folder)): file_digest(p) for p in files}
-        key = self.c["OUTPUT_REPO"] + "/" + remote_path
-        if self.done.get(key, {}).get("files") == signature:
-            return
-        for attempt in range(self.c["UPLOAD_ATTEMPTS"]):
+        """Snapshot and enqueue only: no file hashing, HF calls or retry sleeps."""
+        with self.producer_lock:
+            self.check()
+            safe_relative(remote_path)
+            folder = Path(folder)
+            source = snapshot_source(folder)
+            size = sum(entry[3] for entry in source)
+            key = self.c["OUTPUT_REPO"] + "/" + remote_path
+            with self.condition:
+                if self.last_source.get(key) == source:
+                    return
+                pending = self._pending()
+                max_pending = self.c.get("BACKUP_MAX_PENDING", 8)
+                max_bytes = self.c.get("BACKUP_MAX_BYTES", 32 * 1024**3)
+                reserve = self.c.get("BACKUP_MIN_FREE_BYTES", 2 * 1024**3)
+                free = shutil.disk_usage(self.spool).free
+                if (len(pending) >= max_pending
+                        or sum(j["bytes"] for j in pending) + size > max_bytes
+                        or free - size < reserve):
+                    self.error = (f"UNBACKED: backup backlog/disk limit exceeded (max_pending={max_pending}, "
+                                  f"max_bytes={max_bytes}, new_bytes={size}, free_bytes={free}, reserve_bytes={reserve}); "
+                                  "training stopped, source and pending snapshots retained")
+                    self._persist()
+                    self.condition.notify_all()
+                    raise RuntimeError(self.error)
+            identity = f"{time.time_ns():020d}-{uuid.uuid4().hex}"
+            job = {"id": identity, "repo": self.c["OUTPUT_REPO"], "remote": remote_path,
+                   "source": source, "source_path": str(folder.resolve()), "bytes": size,
+                   "state": "snapshotting", "attempt": 0}
+            partial = self.spool / (identity + ".partial")
+            partial.mkdir(mode=0o700)
+            # Keep incomplete copies on I/O failure; never claim they were queued.
+            atomic_json(partial / "job.json", job)
             try:
-                commit = self.api.upload_folder(repo_id=self.c["OUTPUT_REPO"], repo_type="model", folder_path=str(folder), path_in_repo=remote_path, commit_message=f"Back up {remote_path}")
-                self.done[key] = {"files": signature, "commit": str(getattr(commit, "oid", ""))}
-                atomic_json(self.manifest, self.done)
-                return
-            except Exception as exc:
-                # HTTP exception strings can contain signed URLs. Log class only.
-                print(f"Upload attempt {attempt + 1} failed ({type(exc).__name__}); local assets retained", flush=True)
-                if attempt + 1 < self.c["UPLOAD_ATTEMPTS"]:
-                    time.sleep(self.c["UPLOAD_RETRY_SECONDS"] * (2 ** attempt))
-        raise RuntimeError(f"UNBACKED: upload failed for {remote_path}; all local assets retained")
+                self._snapshot(job, partial)
+                with self.condition:
+                    self.jobs[identity] = job
+                    self.last_source[key] = source
+                    self._persist()
+                    self.condition.notify_all()
+            except BaseException:
+                with self.condition:
+                    self.error = "UNBACKED: local snapshot/ledger failed; source and snapshot files retained"
+                    try:
+                        self._persist()
+                    except Exception:
+                        pass  # Full disk: descriptor/source and main status remain.
+                    self.condition.notify_all()
+                raise
 
     def checkpoint(self, path):
         path = checkpoint_complete(path, require_export=True)
         self.upload(path, f"{self.c['RUN_NAME']}/checkpoints/{path.name}")
+
+    def _transfer(self, job):
+        folder = self.spool / job["id"] / "files"
+        signature = {str(p.relative_to(folder)): file_digest(p) for p in sorted(folder.rglob("*")) if p.is_file()}
+        key = self._key(job)
+        commit = self.done.get(key, {}).get("commit", "")
+        if self.done.get(key, {}).get("files") != signature:
+            for attempt in range(1, self.c["UPLOAD_ATTEMPTS"] + 1):
+                if self.stop.is_set():
+                    return False
+                with self.condition:
+                    self._state(job, "transferring", attempt=attempt)
+                try:
+                    result = self.api.upload_folder(repo_id=job["repo"], repo_type="model", folder_path=str(folder), path_in_repo=job["remote"], commit_message=f"Back up {job['remote']}")
+                    commit = str(getattr(result, "oid", ""))
+                    break
+                except Exception as exc:
+                    # Exception strings may contain signed URLs/tokens. Class only.
+                    print(f"Upload attempt {attempt} failed ({type(exc).__name__}); snapshot retained", flush=True)
+                    with self.condition:
+                        self._state(job, "retrying", error_type=type(exc).__name__)
+                    if attempt == self.c["UPLOAD_ATTEMPTS"]:
+                        raise RuntimeError("Upload retries exhausted") from None
+                    if self.stop.wait(self.c["UPLOAD_RETRY_SECONDS"] * (2 ** (attempt - 1))):
+                        return False
+        self.done[key] = {"files": signature, "commit": commit, "source": job["source"]}
+        atomic_json(self.manifest, self.done)
+        return True
+
+    def _worker(self):
+        job = None
+        try:
+            while True:
+                with self.condition:
+                    self.condition.wait_for(lambda: self.stop.is_set() or self.error or any(j["state"] == "queued" for j in self.jobs.values()))
+                    if self.stop.is_set() or self.error:
+                        return
+                    job = next(j for j in self.jobs.values() if j["state"] == "queued")
+                    self._state(job, "transferring")
+                if not self._transfer(job):
+                    with self.condition:
+                        self._state(job, "queued")
+                    return
+                with self.condition:
+                    self._state(job, "succeeded")
+                    # Cleanup before releasing the queue slot/lock to producers.
+                    shutil.rmtree(self.spool / job["id"])
+                    fsync_dir(self.spool)
+        except BaseException as exc:
+            with self.condition:
+                self.error = "UNBACKED: background backup failed; training must stop, pending snapshots retained"
+                try:
+                    if job is not None:
+                        self._state(job, "failed", error_type=type(exc).__name__)
+                    else:
+                        self._persist()
+                except Exception:
+                    pass  # In-memory failure still propagates if the disk is full.
+                self.condition.notify_all()
+
+    def drain(self):
+        with self.condition:
+            self.condition.wait_for(lambda: self.error or not self._pending())
+            self.check()
+
+    def close(self, drain=True):
+        if self.closed:
+            return
+        try:
+            if drain:
+                self.drain()
+        finally:
+            self.stop.set()
+            with self.condition:
+                self.condition.notify_all()
+            # Do not detach a live HTTP call. On SIGKILL the durable descriptor
+            # remains transferring and is retried idempotently at next startup.
+            self.thread.join()
+            self.closed = True
+            self.lock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        self.close(drain=kind is None)
 
 
 def install_checkpoint_upload(manager, backups):
     original = manager.save
 
     def save(self, *args, **kwargs):
-        path = original(self, *args, **kwargs)
-        if path is not None:
-            backups.checkpoint(path)
-        return path
+        # Serializes save/prune and snapshot creation, not network transfers.
+        with backups.producer_lock:
+            backups.check()
+            prune = getattr(self, "prune", None)
+            if prune is not None:
+                self.prune = lambda: None
+            try:
+                path = original(self, *args, **kwargs)
+                if path is not None:
+                    backups.checkpoint(path)
+            finally:
+                if prune is not None:
+                    self.prune = prune
+            if prune is not None:
+                prune()  # Only after a successful snapshot; errors preserve sources.
+            return path
 
     manager.save = save
+    return original
+
+
+def install_backup_checks(callback_runner, backups):
+    original = callback_runner.run
+
+    def run(self, *args, **kwargs):
+        # Pinned native driver invokes CallbackRunner.run every optimizer step,
+        # even when no callback is due. No trainer code or model tensors change.
+        backups.check()
+        result = original(self, *args, **kwargs)
+        backups.check()
+        return result
+
+    callback_runner.run = run
     return original
 
 
@@ -271,15 +564,21 @@ def stage(c, name, work):
     else:
         from huggingface_hub import HfApi
 
+        from kohakumoss.training.callbacks.runner import CallbackRunner
         from kohakumoss.training.checkpoint.manager import CheckpointManager
 
-        backup = Backups(HfApi(token=credential(c)), c, work)
-        original = install_checkpoint_upload(CheckpointManager, backup)
-        try:
-            ns["main"]()
-            backup.upload(Path(k["OUTPUT_DIR"]) / k["RUN_NAME"] / "export", f"{c['RUN_NAME']}/export")
-        finally:
-            CheckpointManager.save = original
+        with Backups(HfApi(token=credential(c)), c, work) as backup:
+            original = install_checkpoint_upload(CheckpointManager, backup)
+            original_run = install_backup_checks(CallbackRunner, backup)
+            try:
+                ns["main"]()
+                backup.upload(Path(k["OUTPUT_DIR"]) / k["RUN_NAME"] / "export", f"{c['RUN_NAME']}/export")
+                atomic_json(Path(work) / "status.json", {"phase": "draining_backups", "pid": os.getpid(), "unbacked": True})
+            finally:
+                CheckpointManager.save = original
+                CallbackRunner.run = original_run
+            # Context exit drains all checkpoints AND final export, then joins
+            # the non-daemon worker; parent cannot mark success before this.
         return
     ns["main"]()
 
@@ -310,11 +609,15 @@ def run_worker(c, work):
     api.create_repo(repo_id=c["OUTPUT_REPO"], repo_type="model", private=True, exist_ok=True)
     if not api.repo_info(c["OUTPUT_REPO"], repo_type="model").private:
         raise ValueError("OUTPUT_REPO already exists publicly; refusing to upload")
-    backup = Backups(api, c, work)
-    # Retry older completed checkpoints before another optimizer step/prune.
-    for p in sorted((output / "checkpoints").glob("step_*")):
-        if re.fullmatch(r"step_\d{8}", p.name):
-            backup.checkpoint(p)
+    # Startup/resume may wait for network: recover pending snapshots even when
+    # their original checkpoint has already been pruned. No worker overlaps the
+    # training subprocess or competes for its manifest.
+    with Backups(api, c, work) as backup:
+        backup.drain()
+        for p in sorted((output / "checkpoints").glob("step_*")):
+            if re.fullmatch(r"step_\d{8}", p.name):
+                backup.checkpoint(p)
+                backup.drain()
     atomic_json(work / "status.json", {"phase": "downloading", "pid": os.getpid(), "unbacked": False})
     archive = hf_hub_download(repo_id=c["DATASET_REPO"], repo_type="dataset", filename=c["DATASET_FILE"], revision=c["DATASET_REVISION"], token=token)
     data = work / "dataset"
@@ -333,7 +636,8 @@ def run_worker(c, work):
     metadata.mkdir(exist_ok=True)
     atomic_json(metadata / "training.json", k)
     atomic_json(metadata / "provenance.json", {"trainer_commit": TRAINER_COMMIT, "runner_sha256": file_digest(__file__), "dataset_repo": c["DATASET_REPO"], "dataset_revision": c["DATASET_REVISION"], "dataset_file": c["DATASET_FILE"], "dataset_sha256": archive_hash, "rows": rows, "images": images, "resume": str(resume) if resume else ""})
-    backup.upload(metadata, f"{c['RUN_NAME']}/metadata")
+    with Backups(api, c, work) as backup:
+        backup.upload(metadata, f"{c['RUN_NAME']}/metadata")
     for name in ("latents", "text", "train"):
         atomic_json(work / "status.json", {"phase": name, "pid": os.getpid(), "rows": rows, "images": images})
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "--config", str(work / "request.json"), "--stage", name], cwd=c["PROJECT_DIR"], check=True)

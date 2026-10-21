@@ -132,6 +132,7 @@ class RunnerTests(unittest.TestCase):
         api = Mock()
         api.upload_folder.side_effect = [OSError("network"), SimpleNamespace(oid="commit")]
         backup = runner.Backups(api, self.c, self.root)
+        self.addCleanup(backup.close, drain=False)
 
         class Manager:
             def save(self, step, parts):
@@ -141,19 +142,21 @@ class RunnerTests(unittest.TestCase):
                 return p
 
         original = runner.install_checkpoint_upload(Manager, backup)
-        with patch.object(runner.time, "sleep"):
-            self.assertEqual(Manager().save(1, {}), p)
+        self.addCleanup(setattr, Manager, "save", original)
+        self.assertEqual(Manager().save(1, {}), p)
+        backup.drain()
         self.assertEqual(api.upload_folder.call_count, 2)
         stored = json.loads((self.root / "uploaded.json").read_text())
         self.assertIn("rng.0.pt", next(iter(stored.values()))["files"])
         self.assertIn("export/lora.safetensors", next(iter(stored.values()))["files"])
         backup.checkpoint(p)
+        backup.drain()
         self.assertEqual(api.upload_folder.call_count, 2)
-        Manager.save = original
 
     def test_incomplete_export_or_partial_never_uploaded(self):
         api = Mock()
         backup = runner.Backups(api, self.c, self.root)
+        self.addCleanup(backup.close, drain=False)
         p = checkpoint(self.root, export=False)
         with self.assertRaises(ValueError):
             backup.checkpoint(p)
@@ -168,8 +171,10 @@ class RunnerTests(unittest.TestCase):
         api = Mock()
         api.upload_folder.side_effect = OSError("offline")
         backup = runner.Backups(api, self.c, self.root)
-        with patch.object(runner.time, "sleep"), self.assertRaisesRegex(RuntimeError, "UNBACKED"):
-            backup.checkpoint(p)
+        self.addCleanup(backup.close, drain=False)
+        backup.checkpoint(p)
+        with self.assertRaisesRegex(RuntimeError, "UNBACKED"):
+            backup.drain()
         self.assertEqual(api.upload_folder.call_count, 3)
         self.assertTrue((p / "optim.pt").is_file())
         self.assertFalse((self.root / "uploaded.json").exists())
@@ -177,9 +182,11 @@ class RunnerTests(unittest.TestCase):
     def test_manifest_scoped_to_target_repo(self):
         p = checkpoint(self.root)
         api = Mock()
-        runner.Backups(api, self.c, self.root).checkpoint(p)
+        with runner.Backups(api, self.c, self.root) as backup:
+            backup.checkpoint(p)
         self.c["OUTPUT_REPO"] = "user/other"
-        runner.Backups(api, self.c, self.root).checkpoint(p)
+        with runner.Backups(api, self.c, self.root) as backup:
+            backup.checkpoint(p)
         self.assertEqual(api.upload_folder.call_count, 2)
 
 
