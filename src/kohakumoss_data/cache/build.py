@@ -1,7 +1,7 @@
 """Offline cache passes: every geometry / flip a planner can emit, every caption
 variant; keys already stored are skipped (a pass resumes)."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
@@ -64,9 +64,11 @@ def build_latents(
     check_spec(encode, dataset.cfg.latent_encoder_spec, "LATENT_ENCODER_SPEC")
     cache = dataset.latents
     groups: dict[tuple[int, int], list[tuple[PlanItem, str]]] = {}
+    seen_keys: set[str] = set()
     for item in latent_items(dataset):
         key = cache.key(dataset.catalog[item.row_id], item)
-        if key not in cache.store:
+        if key not in seen_keys and key not in cache.store:
+            seen_keys.add(key)
             groups.setdefault(item.target_hw, []).append((item, key))
     chunks = [
         (target, groups[target][i : i + batch_size])
@@ -109,10 +111,12 @@ def build_text(
     encode: EncodeText,
     batch_size: int = 16,
     progress: Callable[[int], None] | None = None,
+    extra_texts: Iterable[str] = (),
 ) -> int:
-    """Encode and store every missing caption embedding; returns how many were written.
-    Raises ValueError unless `encode.encoder_id` equals the cache's TEXT_ENCODER_ID and
-    its `encoder_spec` (when it reports one) TEXT_ENCODER_SPEC."""
+    """Encode missing captions, empty prompt and optional sampling texts once each.
+    Returns how many were written. Raises ValueError unless `encode.encoder_id`
+    equals TEXT_ENCODER_ID and its reported `encoder_spec` equals TEXT_ENCODER_SPEC.
+    Existing callers may omit `extra_texts`; duplicates and empty strings are safe."""
     cache = dataset.texts
     cfg = dataset.cfg
     ident = getattr(encode, "encoder_id", None)
@@ -122,7 +126,8 @@ def build_text(
             "set TEXT_ENCODER_ID to the encoder that writes this cache"
         )
     check_spec(encode, cfg.text_encoder_spec, "TEXT_ENCODER_SPEC")
-    todo = [c for c in caption_set(dataset) if cache.key(c) not in cache.store]
+    captions = sorted(set(caption_set(dataset)).union(extra_texts))
+    todo = [c for c in captions if cache.key(c) not in cache.store]
     for i in range(0, len(todo), batch_size):
         chunk = todo[i : i + batch_size]
         for caption, emb in zip(chunk, encode(chunk)):

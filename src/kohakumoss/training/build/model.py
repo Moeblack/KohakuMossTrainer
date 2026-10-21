@@ -51,6 +51,8 @@ from kohakumoss.training.weights import component, stored_dit_precision
 from kohakumoss.types.plans import PrecisionConfig
 from kohakumoss.weights import DIT, TEXT, VAE
 from kohakumoss_common.hostmem import trim_heap
+from kohakumoss_data.cache.tensor_cache import TextCache
+from kohakumoss_data.config import DataConfig, encoder_key_id
 from kohakumoss_kernels.hardware.current import rng_kept
 
 log = get_logger(__name__)
@@ -385,6 +387,35 @@ def sample_texts(k: dict) -> list[str]:
     return list(k["SAMPLE_PROMPTS"]) + [k.get("SAMPLE_NEGATIVE", "")]
 
 
+def cached_sample_embeds(k: dict, device: torch.device) -> list | None:
+    """All sampling texts under the training data's exact identity/spec/storage keys.
+
+    A missing DB or key falls back to live encoding, never to another spec. Storage
+    and decoding errors propagate: a corrupt cache must not silently look like a miss.
+    Resolving the compute spec reads weight metadata, not the TE weights themselves.
+    """
+    cfg = DataConfig.from_knobs(data_knobs(k, device))
+    if cfg.text_encoder_id != QwenTextEncoder.encoder_id:
+        log.info("sample text cache: encoder identity differs; using live encoding")
+        return None
+    path = Path(cfg.cache_dir) / "text.db" if cfg.cache_dir else None
+    if path is None or not path.is_file():
+        log.info("sample text cache: no text.db; using live encoding")
+        return None
+    cache = TextCache(
+        str(path), "offline",
+        encoder_key_id(cfg.text_encoder_id, cfg.text_encoder_spec), cfg.cache_dtype,
+    )
+    texts = sample_texts(k)
+    found = {caption: cache.get(cache.key(caption)) for caption in dict.fromkeys(texts)}
+    missing = sum(value is None for value in found.values())
+    if missing:
+        log.info(f"sample text cache: {missing} unique texts missing; using live encoding")
+        return None
+    log.info(f"sample text cache: all {len(texts)} texts hit; skipping text encoder load")
+    return [found[caption].to(device) for caption in texts]
+
+
 def build_encoders(
     k: dict, device: torch.device, prec: PrecisionConfig, reserve=0, mem_plan=None
 ):
@@ -414,7 +445,9 @@ def build_encoders(
         )
         rule = encoder_rule(k, "vae", mem_plan)
         log.info(f"VAE placement: {hl(vae.plan.memory)} ({rule})")
-    if (online_text or sampling) and text_path:
+    if sampling and not online_text:
+        embeds = cached_sample_embeds(k, device)
+    if (online_text or (sampling and embeds is None)) and text_path:
         plan, te_device = training_text_plan(k, device, mem_plan)
         if not online_text:
             plan = replace(plan, free_after_use=True)

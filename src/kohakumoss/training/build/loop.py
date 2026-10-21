@@ -248,6 +248,9 @@ def sample_settings(k: dict, embeds: list | None = None) -> dict:
     """MossPipeline.generate kwargs from the SAMPLE_* knobs (one seed per prompt); with
     `embeds` (the build-time encodings of the prompts, then the negative) the pipeline
     needs no text encoder."""
+    batch = k.get("SAMPLE_BATCH", 4)
+    if type(batch) is not int or batch < 1:
+        raise ValueError("SAMPLE_BATCH must be a positive integer")
     prompts = list(k["SAMPLE_PROMPTS"])
     seeds = list(k["SAMPLE_SEEDS"]) or [0]
     text = {
@@ -261,6 +264,7 @@ def sample_settings(k: dict, embeds: list | None = None) -> dict:
         )
     return {
         **text,
+        "batch": batch,
         "sizes": tuple(k["SAMPLE_SIZE"]),
         "steps": k["SAMPLE_STEPS"],
         "cfg": k["SAMPLE_CFG"],

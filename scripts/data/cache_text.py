@@ -19,11 +19,13 @@ CAPTION_VARIANTS and SEED as training.
 
 import logging
 import sys
+from typing import Annotated
 
+from kohakuengine import FormatArg
 from tqdm.auto import tqdm
 
 from kohakumoss.encoders.specs import text_encoder_kwargs
-from kohakumoss_common.knobs import check_script
+from kohakumoss_common.knobs import check_script, prompt_list
 from kohakumoss_common.log import get_logger, setup
 from kohakumoss_data.cache.build import build_text
 from kohakumoss_data.dataset import MossDataset
@@ -39,6 +41,8 @@ CACHE_DIR = ""
 CACHE_DTYPE = "bf16"  # "bf16" | "fp16" | "fp32" | "fp8"
 TEXT_ENCODER_ID = "qwen3.5-9b"
 SEED = 0
+SAMPLE_PROMPTS: Annotated[list, FormatArg(prompt_list)] = []
+SAMPLE_NEGATIVE = ""  # same shared negative prompt; empty is always cached
 
 # ===================== ENCODER =====================
 TEXT_ENCODER = "kohakumoss.encoders.text_encoder"
@@ -64,7 +68,13 @@ def main() -> None:
     def progress(n: int) -> None:
         bar.update(n - bar.n)
 
-    n = build_text(dataset, encode, ENCODE_BATCH, progress)
+    n = build_text(
+        dataset,
+        encode,
+        ENCODE_BATCH,
+        progress,
+        extra_texts=[*SAMPLE_PROMPTS, SAMPLE_NEGATIVE],
+    )
     bar.close()
     log.info(f"wrote {n} embeddings to {cfg.cache_dir}")
 

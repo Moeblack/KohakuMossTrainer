@@ -12,7 +12,7 @@ ENCODER_FIELDS = {
     "VAE_": ("VAE_ENCODE", tuple(f.name for f in fields(VaePlan))),
 }
 # train SAMPLE_<NAME> = sample <NAME>; train SAMPLE_SIZE = sample SIZES
-SAMPLE_NAMES = ("PROMPTS", "SEEDS", "NEGATIVE", "SKIP_LAYERS", "CFG", "SHIFT")
+SAMPLE_NAMES = ("PROMPTS", "SEEDS", "NEGATIVE", "SKIP_LAYERS", "CFG", "SHIFT", "BATCH")
 RENAMED_SAMPLE = {
     "DTYPE": "renamed to PRECISION (the compute dtype)",
     "MEMORY": "renamed to MEMORY_PROFILE",

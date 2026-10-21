@@ -28,7 +28,7 @@ TEXT_ENCODE = {}  # TextEncoderPlan fields (docs/internals/text-encoder.md):
 #   "layout": "packed" (varlen) | "padded" | "single"; "forward": "kernels" | "hf" (transformers modules; single / padded)
 #   "ahead": 1 (TEXT_CACHE "online" / "off": host batches encoded per TE pass); "ahead_device": "host" | "device" (where results wait)
 #   "kernels": {} (op -> backend, e.g. {"gated_delta_rule_varlen": "triton"})
-# Sample prompts are encoded once at build; with TEXT_CACHE="offline" the TE is freed after that.
+# Offline sampling reuses matching cached prompts, otherwise encodes once and frees the TE.
 VAE = ""  # "" = <WEIGHTS>/vae (ComfyUI folder: flux2-vae_small, else flux2-vae) | a file name under vae/ | a path
 VAE_ENCODE = {}  # VaePlan fields (docs/internals/offload.md#vae):
 #   "memory": "resident" (default) | "offload" (VAE in per pass) | "ring" (block rings; "stream" is accepted too) | "auto" | "cpu" (LATENT_CACHE="offline" only)
@@ -213,6 +213,7 @@ SAMPLE_PROMPTS: Annotated[list, FormatArg(prompt_list)] = (
 SAMPLE_NEGATIVE = ""
 SAMPLE_EVERY = 0  # steps; 0 = off
 SAMPLE_STEPS = 50
+SAMPLE_BATCH = 4  # maximum images per sampling pass; independent of prompt count
 SAMPLE_CFG = 3.0
 SAMPLE_SHIFT = 5.0
 SAMPLE_SKIP_LAYERS = (22,)
