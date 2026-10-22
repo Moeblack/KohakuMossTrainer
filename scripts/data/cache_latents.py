@@ -62,7 +62,10 @@ def main() -> None:
     encode = build_encoder(IMAGE_ENCODER, latent_encoder_kwargs(globals()))
     spec = getattr(encode, "encoder_spec", "")
     cfg = data_config(
-        globals(), latent_cache="offline", text_cache="off", latent_encoder_spec=spec
+        # Cache construction enumerates all rows, not training token batches.
+        # Exact lengths do not exist until the later text-cache pass completes.
+        globals(), latent_cache="offline", text_cache="off", token_budget="estimate",
+        latent_encoder_spec=spec,
     )
     dataset = MossDataset(cfg)
     quiet = not logging.getLogger("kohakumoss").isEnabledFor(logging.INFO)

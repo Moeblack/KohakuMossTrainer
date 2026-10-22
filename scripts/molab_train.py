@@ -813,6 +813,48 @@ def launch(c, config):
         lock.close()  # Child retains the same flock until completion/crash.
 
 
+def record_failure(c, work, exc):
+    """Keep child failure context and report backup evidence, not generic loss."""
+    work = Path(work)
+
+    def state_file(name):
+        path = work / name
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    previous = state_file("status.json")
+    child_failed = previous.get("phase") == "failed" and isinstance(exc, subprocess.CalledProcessError)
+    failed_phase = previous.get("failed_phase") if child_failed else previous.get("phase", "starting")
+    backup = state_file("backup-status.json")
+    manifest = state_file("uploaded.json")
+    output = Path(c["OUTPUT_DIR"]) / c["RUN_NAME"]
+    checkpoints = sorted((output / "checkpoints").glob("step_*"))
+    assets = [(p, f"checkpoints/{p.name}") for p in checkpoints]
+    if (output / "export").exists():
+        assets.append((output / "export", "export"))
+    unbacked = bool(backup.get("unbacked") or backup.get("error") or backup.get("pending")
+                    or state_file("pending.json").get("jobs")
+                    or any((work / "backup-queue").glob("*")))
+    for path, relative in assets:
+        entry = manifest.get(f"{c['OUTPUT_REPO']}/{c['RUN_NAME']}/{relative}", {})
+        if entry.get("source") != snapshot_source(path):
+            unbacked = True
+    message = "Stopped; local dataset, caches and run assets retained. "
+    if checkpoints:
+        message += "Resume only from a complete local checkpoint with explicit RESUME. "
+    else:
+        message += "No local training checkpoint exists; cache/setup failure can be retried with the same run. "
+    message += "Local assets have unconfirmed backups." if unbacked else "No pending or unconfirmed saved training assets."
+    state = {"phase": "failed", "active": False, "failed_phase": failed_phase,
+             "error_type": previous.get("error_type") if child_failed else type(exc).__name__,
+             "unbacked": unbacked, "local_assets_retained": True,
+             "checkpoint_count": len(checkpoints), "message": message}
+    if isinstance(exc, subprocess.CalledProcessError):
+        # Do not persist exc.cmd/str(exc): arguments/URLs can carry credentials.
+        state.update(worker_error_type=type(exc).__name__, returncode=exc.returncode)
+    atomic_json(work / "status.json", state)
+    return state
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -828,8 +870,9 @@ def main():
     if not args.worker and not args.stage:
         launch(c, args.config)
         return
-    validate_config(c)
+    # Validation failures in a worker/stage also need a terminal status.
     try:
+        validate_config(c)
         if args.stage:
             stage(c, args.stage, work)
         else:
@@ -838,9 +881,9 @@ def main():
             os.fstat(args.lock_fd)
             run_worker(c, work)
     except BaseException as exc:
-        atomic_json(work / "status.json", {"phase": "failed", "error_type": type(exc).__name__, "unbacked": True, "message": "Stopped; local assets retained. Inspect runner.log, restore complete state with RESUME; backup is NOT guaranteed."})
+        state = record_failure(c, work, exc)
         # Deliberately avoid traceback/HTTP exception URLs containing credentials.
-        print(f"FAILED ({type(exc).__name__}): local assets retained; backup NOT guaranteed.", flush=True)
+        print(f"FAILED ({type(exc).__name__}): {state['message']}", flush=True)
         if isinstance(exc, (ValueError, RuntimeError)):
             print(str(exc), flush=True)
         raise SystemExit(1) from None

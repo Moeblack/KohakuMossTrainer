@@ -59,7 +59,10 @@ def main() -> None:
     encode = build_encoder(TEXT_ENCODER, text_encoder_kwargs(globals()))
     spec = getattr(encode, "encoder_spec", "")
     cfg = data_config(
-        globals(), latent_cache="off", text_cache="offline", text_encoder_spec=spec
+        # Building the cache cannot require lengths from that same empty cache.
+        # This override is local to the pass; training keeps its exact budget.
+        globals(), latent_cache="off", text_cache="offline", token_budget="estimate",
+        text_encoder_spec=spec,
     )
     dataset = MossDataset(cfg)
     quiet = not logging.getLogger("kohakumoss").isEnabledFor(logging.INFO)
