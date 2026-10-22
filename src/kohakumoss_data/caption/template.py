@@ -120,7 +120,7 @@ class TagTemplate:
         head = _keep_values(row, self.keep) + fixed
         return [self._norm(t) for t in head + body]
 
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+    def render(self, row: CatalogRow, rng: np.random.Generator, variant: int = 0) -> str:
         return self.prefix + self.joiner.join(self.tag_list(row, rng)) + self.suffix
 
     def estimate_chars(self, catalog) -> np.ndarray:
@@ -140,9 +140,9 @@ class NaturalTemplate:
         self.keep = tuple(keep)
         self.fallback = build(fallback or {"template": "tags"}, CAPTIONS, "template")
 
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+    def render(self, row: CatalogRow, rng: np.random.Generator, variant: int = 0) -> str:
         if not row.caption_nl:
-            return self.fallback.render(row, rng)
+            return self.fallback.render(row, rng, variant=variant)
         head = _keep_values(row, self.keep)
         lead = (", ".join(head) + ". ") if head else ""
         return lead + row.caption_nl
@@ -164,10 +164,10 @@ class MixTemplate:
         self.nl = build(nl or {"template": "nl"}, CAPTIONS, "template")
         self.tags = build(tags or {"template": "tags"}, CAPTIONS, "template")
 
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+    def render(self, row: CatalogRow, rng: np.random.Generator, variant: int = 0) -> str:
         if row.caption_nl and rng.random() < self.p_nl:
-            return self.nl.render(row, rng)
-        return self.tags.render(row, rng)
+            return self.nl.render(row, rng, variant=variant)
+        return self.tags.render(row, rng, variant=variant)
 
     def estimate_chars(self, catalog) -> np.ndarray:
         return np.maximum(
@@ -190,7 +190,7 @@ class JsonTemplate:
         self.fields = tuple(fields)
         self._render = make_renderer(style, order, field_dropout, keep)
 
-    def render(self, row: CatalogRow, rng: np.random.Generator) -> str:
+    def render(self, row: CatalogRow, rng: np.random.Generator, variant: int = 0) -> str:
         data = dict(row.json or {})
         for name in self.fields:
             value = getattr(row, name, None)
@@ -205,6 +205,30 @@ class JsonTemplate:
             chars = _field_chars(catalog, name)
             out += chars + (len(name) + 3) * (chars > 0)
         return out
+
+
+@CAPTIONS.register("options")
+class OptionsTemplate:
+    """Select an authored caption by planner variant, without another random draw."""
+
+    def render(self, row: CatalogRow, rng: np.random.Generator, variant: int = 0) -> str:
+        options = (row.json or {}).get("caption_options")
+        if not isinstance(options, list) or not options or not all(
+            isinstance(option, str) for option in options
+        ):
+            raise ValueError(
+                f"row {row.id}: caption_options must be a non-empty list of strings"
+            )
+        if not 0 <= variant < len(options):
+            raise IndexError(
+                f"row {row.id}: caption variant {variant} is outside "
+                f"caption_options (count={len(options)})"
+            )
+        return options[variant]
+
+    def estimate_chars(self, catalog) -> np.ndarray:
+        """Conservative column-only bound; exact budgets use the selected text cache."""
+        return catalog.chars["json_chars"]
 
 
 def build_template(caption: dict | str | None):

@@ -97,7 +97,7 @@ def first_captions(
         rows = source.scan()
     out = []
     for i, row in enumerate(rows):
-        text = template.render(row, rng_of("caption", seed, i, 0))
+        text = template.render(row, rng_of("caption", seed, i, 0), variant=0)
         if text:
             out.append(text)
         if len(out) == n or i + 1 == limit:
@@ -253,7 +253,9 @@ class MossDataset:
         """Caption variant `variant` of row `row_id` (fixed per seed, row, variant)."""
         row = self.catalog[row_id]
         template = self.templates[int(self.catalog.source[row_id])]
-        return template.render(row, rng_of("caption", self.cfg.seed, row_id, variant))
+        return template.render(
+            row, rng_of("caption", self.cfg.seed, row_id, variant), variant=variant
+        )
 
     def _live_text(self) -> np.ndarray:
         return self._text_est[np.asarray(self.catalog.live, dtype=bool)]

@@ -81,7 +81,9 @@ def snapshot_source(folder):
 
 
 def missing_config(c):
-    missing = [k for k in ("DATASET_REPO", "DATASET_FILE", "OUTPUT_REPO", "RUN_NAME") if not c.get(k)]
+    missing = [k for k in ("DATASET_REPO", "OUTPUT_REPO", "RUN_NAME") if not c.get(k)]
+    if not c.get("DATASET_FILES") and not c.get("DATASET_FILE"):
+        missing.append("DATASET_FILES or DATASET_FILE")
     if c.get("TRIGGER_WORD") is None:
         missing.append('TRIGGER_WORD (use "" explicitly for no trigger)')
     return missing
@@ -91,18 +93,34 @@ def validate_config(c):
     missing = missing_config(c)
     if missing:
         return missing
+    trainer_pin(c)
     for key in ("DATASET_REPO", "OUTPUT_REPO"):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", c[key]):
             raise ValueError(f"{key} must be an explicit owner/repository")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}", c["RUN_NAME"]):
         raise ValueError("RUN_NAME must be a safe, unique directory name")
-    safe_relative(c["DATASET_FILE"])
-    if not c["DATASET_FILE"].lower().endswith(".zip"):
-        raise ValueError("DATASET_FILE must name a ZIP in the HF dataset repository")
+    dataset_files(c)
     if not isinstance(c["TRIGGER_WORD"], str) or "\x00" in c["TRIGGER_WORD"]:
         raise ValueError("TRIGGER_WORD must be text")
     k = c["TRAIN"]
-    for key, value in {"PARALLEL": "none", "DRIVER": "native", "ALGO": "lora", "LATENT_CACHE": "offline", "TEXT_CACHE": "offline", "CHECKPOINT_EXPORT": True, "FINAL_CHECKPOINT": True, "SAVE_FORMAT": "comfy"}.items():
+    if k.get("ALGO") not in ("lora", "lokr"):
+        raise ValueError("This runner requires ALGO lora or lokr")
+    if k["ALGO"] == "lokr":
+        if type(k.get("DIM", 32)) is not int or k.get("DIM", 32) <= 0:
+            raise ValueError("LoKr DIM must be a positive integer")
+        alpha = k.get("ALPHA", 32.0)
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 < alpha < float("inf"):
+            raise ValueError("LoKr ALPHA must be finite and positive")
+        kwargs = k.get("ALGO_KWARGS", {})
+        if not isinstance(kwargs, dict):
+            raise ValueError("LoKr ALGO_KWARGS must be an object")
+        factor = kwargs.get("factor", -1)
+        if type(factor) is not int or (factor != -1 and factor <= 0):
+            raise ValueError("LoKr factor must be -1 or a positive integer")
+        for key in ("full_matrix", "decompose_both", "use_tucker"):
+            if key in kwargs and type(kwargs[key]) is not bool:
+                raise ValueError(f"LoKr {key} must be a boolean")
+    for key, value in {"PARALLEL": "none", "DRIVER": "native", "LATENT_CACHE": "offline", "TEXT_CACHE": "offline", "CHECKPOINT_EXPORT": True, "FINAL_CHECKPOINT": True, "SAVE_FORMAT": "comfy"}.items():
         if k.get(key) != value:
             raise ValueError(f"This runner requires TRAIN[{key!r}]={value!r}")
     if k["SAMPLE_EVERY"] and not k["SAMPLE_PROMPTS"]:
@@ -115,6 +133,28 @@ def validate_config(c):
     if c.get("BACKUP_MIN_FREE_BYTES", 2 * 1024**3) < 0 or c["UPLOAD_RETRY_SECONDS"] < 0:
         raise ValueError("Backup free-space reserve and retry delay cannot be negative")
     return []
+
+
+def trainer_pin(c):
+    pin = c.get("TRAINER_COMMIT", TRAINER_COMMIT)
+    if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", pin):
+        raise ValueError("TRAINER_COMMIT must be a full 40-hex commit")
+    return pin.lower()
+
+
+def dataset_files(c):
+    files = c.get("DATASET_FILES")
+    if files is None:
+        files = [c.get("DATASET_FILE")]
+    elif not isinstance(files, list) or len(files) not in (1, 2):
+        raise ValueError("DATASET_FILES must contain one ZIP or [images ZIP, captions ZIP]")
+    for name in files:
+        if not isinstance(name, str) or not name.lower().endswith(".zip"):
+            raise ValueError("Dataset files must name ZIPs in the HF dataset repository")
+        safe_relative(name)
+    if len(set(files)) != len(files):
+        raise ValueError("Dataset ZIP names must be distinct")
+    return files
 
 
 def safe_relative(name):
@@ -152,6 +192,91 @@ def safe_extract(archive, destination, max_bytes):
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
         raise
+
+
+def prepare_dual_rows(root, c):
+    from PIL import Image
+
+    root = Path(root).resolve()
+    images = {}
+    captions = {}
+    image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".avif"}
+    for folder, entries, extensions in (("images", images, image_extensions), ("captions", captions, {".json"})):
+        base = root / folder
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in extensions:
+                continue
+            relative = path.relative_to(base)
+            if len(relative.parts) != 2:
+                raise ValueError(f"Expected artist/id file in {folder}: {relative}")
+            key = relative.with_suffix("").as_posix()
+            if key in entries:
+                raise ValueError(f"Duplicate {folder} stem: {key}")
+            entries[key] = path
+    if not images or images.keys() != captions.keys():
+        raise ValueError("Images and caption JSONs must match one-to-one by artist/id stem")
+    rows = []
+    for key, image in images.items():
+        payload = json.loads(captions[key].read_text(encoding="utf-8"))
+        values = payload.get("caption") if isinstance(payload, dict) else None
+        if not isinstance(values, dict):
+            raise ValueError(f"Missing caption object: {key}")
+        options = [values.get(name) for name in ("short", "medium", "long")]
+        if any(not isinstance(text, str) or not text.strip() or "\x00" in text for text in options):
+            raise ValueError(f"Require nonempty short/medium/long captions: {key}")
+        # Captions are authoritative, including untagged character captions.
+        # Directory names are matching keys, not identities to inject into text.
+        with Image.open(image) as im:
+            im.verify()
+        with Image.open(image) as im:
+            im.load()
+        rows.append({"image": str(image), "caption_options": options})
+    normalized = root.parent / "validated_train.jsonl"
+    normalized.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    return normalized, len(rows), len(images)
+
+
+def prepare_dataset(c, work, download):
+    work = Path(work)
+    files = dataset_files(c)
+    token = credential(c, dataset=True)
+    archives = [download(repo_id=c["DATASET_REPO"], repo_type="dataset", filename=name,
+                         revision=c["DATASET_REVISION"], token=token) for name in files]
+    identity = {"repo": c["DATASET_REPO"], "revision": c["DATASET_REVISION"],
+                "archives": [{"file": name, "sha256": file_digest(path)} for name, path in zip(files, archives)]}
+    data = work / "dataset"
+    marker = work / "dataset.identity.json"
+    if data.exists():
+        if not marker.exists() and len(files) == 1:
+            legacy = work / "dataset.sha256"
+            old_request = work / "dataset.legacy-request.json"
+            if not old_request.exists():
+                old_request = work / "request.json"
+            if legacy.is_file() and old_request.is_file():
+                old = json.loads(old_request.read_text(encoding="utf-8"))
+                if (old.get("DATASET_REPO") == c["DATASET_REPO"]
+                        and old.get("DATASET_REVISION") == c["DATASET_REVISION"]
+                        and old.get("DATASET_FILE") == files[0]
+                        and not old.get("DATASET_FILES")
+                        and legacy.read_text().strip() == identity["archives"][0]["sha256"]):
+                    atomic_json(marker, identity)
+        if not marker.is_file() or json.loads(marker.read_text(encoding="utf-8")) != identity:
+            raise ValueError("Dataset changed/incomplete extraction: use a new RUN_NAME")
+    else:
+        if len(archives) == 1:
+            safe_extract(archives[0], data, c["MAX_EXTRACT_BYTES"])
+        else:
+            data.mkdir(parents=True)
+            try:
+                for archive, folder in zip(archives, ("images", "captions")):
+                    safe_extract(archive, data / folder, c["MAX_EXTRACT_BYTES"])
+            except BaseException:
+                shutil.rmtree(data, ignore_errors=True)
+                raise
+        atomic_json(marker, identity)
+    prepare = prepare_dual_rows if len(files) == 2 else prepare_rows
+    catalog, rows, images = prepare(data, c)
+    return data, catalog, rows, images, identity
 
 
 def prepare_rows(root, c):
@@ -236,12 +361,16 @@ def resolve_resume(value, output):
     return checkpoint_complete(path)
 
 
-def credential(c):
-    token = os.environ.get("HF_TOKEN")
+def credential(c, dataset=False):
+    key = "DATASET_HF_TOKEN_PATH" if dataset else "HF_TOKEN_PATH"
+    path = c.get(key)
+    if dataset and not path:
+        return credential(c)
+    token = None if path else os.environ.get("HF_TOKEN")
     if not token:
-        p = Path(c["TOKEN_FILE"]).expanduser()
+        p = Path(path or c["TOKEN_FILE"]).expanduser()
         if p.stat().st_mode & 0o077:
-            raise ValueError("Private TOKEN_FILE must have permissions 0600")
+            raise ValueError(f"Private {key} must have permissions 0600")
         token = p.read_text().strip()
     if not token:
         raise ValueError("Restore a private HF credential on this machine first")
@@ -594,7 +723,7 @@ def run_worker(c, work):
     if not resume and (output / "export").exists():
         raise ValueError("Existing final export: choose a new RUN_NAME or explicit RESUME")
     commit = subprocess.check_output(["git", "-C", c["PROJECT_DIR"], "rev-parse", "HEAD"], text=True).strip()
-    if commit != TRAINER_COMMIT:
+    if commit != trainer_pin(c):
         raise ValueError("CELL1 trainer revision differs from the runner's supported pin")
     k = c["TRAIN"]
     for knob, folder in (("TRANSFORMER", "diffusion_models"), ("TEXT_ENCODER", "text_encoders"), ("VAE", "vae")):
@@ -619,26 +748,26 @@ def run_worker(c, work):
                 backup.checkpoint(p)
                 backup.drain()
     atomic_json(work / "status.json", {"phase": "downloading", "pid": os.getpid(), "unbacked": False})
-    archive = hf_hub_download(repo_id=c["DATASET_REPO"], repo_type="dataset", filename=c["DATASET_FILE"], revision=c["DATASET_REVISION"], token=token)
-    data = work / "dataset"
-    archive_hash = file_digest(archive)
-    marker = work / "dataset.sha256"
-    if data.exists() and (not marker.exists() or marker.read_text() != archive_hash):
-        raise ValueError("Dataset changed/incomplete extraction: use a new RUN_NAME (do not silently change resume data)")
-    if not data.exists():
-        safe_extract(archive, data, c["MAX_EXTRACT_BYTES"])
-        marker.write_text(archive_hash)
-    catalog, rows, images = prepare_rows(data, c)
+    data, catalog, rows, images, identity = prepare_dataset(c, work, hf_hub_download)
     k = dict(c["TRAIN"])
     k.update(DATASETS=[{"source": "jsonl", "path": str(catalog), "root": str(data)}], CACHE_DIR=str(work / "cache"), OUTPUT_DIR=c["OUTPUT_DIR"], RUN_NAME=c["RUN_NAME"], RESUME=str(resume) if resume else "")
+    if len(dataset_files(c)) == 2:
+        k.update(CAPTION={"template": "options"}, CAPTION_VARIANTS=3)
     atomic_json(work / "training.json", k)
     metadata = work / "metadata"
     metadata.mkdir(exist_ok=True)
     atomic_json(metadata / "training.json", k)
-    atomic_json(metadata / "provenance.json", {"trainer_commit": TRAINER_COMMIT, "runner_sha256": file_digest(__file__), "dataset_repo": c["DATASET_REPO"], "dataset_revision": c["DATASET_REVISION"], "dataset_file": c["DATASET_FILE"], "dataset_sha256": archive_hash, "rows": rows, "images": images, "resume": str(resume) if resume else ""})
+    atomic_json(metadata / "provenance.json", {"trainer_commit": commit, "runner_sha256": file_digest(__file__), "dataset_repo": c["DATASET_REPO"], "dataset_revision": c["DATASET_REVISION"], "dataset_identity": identity, "rows": rows, "images": images, "resume": str(resume) if resume else ""})
     with Backups(api, c, work) as backup:
         backup.upload(metadata, f"{c['RUN_NAME']}/metadata")
     for name in ("latents", "text", "train"):
+        if name == "train" and len(dataset_files(c)) == 2:
+            atomic_json(work / "status.json", {"phase": "planner_preflight", "pid": os.getpid()})
+            subprocess.run([sys.executable, str(Path(c["PROJECT_DIR"]) / "scripts/molab_preflight.py"),
+                            "--config", str(work / "training.json"), "--output", str(metadata / "planner-preflight.json")],
+                           cwd=c["PROJECT_DIR"], check=True)
+            with Backups(api, c, work) as backup:
+                backup.upload(metadata, f"{c['RUN_NAME']}/metadata")
         atomic_json(work / "status.json", {"phase": name, "pid": os.getpid(), "rows": rows, "images": images})
         subprocess.run([sys.executable, str(Path(__file__).resolve()), "--config", str(work / "request.json"), "--stage", name], cwd=c["PROJECT_DIR"], check=True)
     atomic_json(work / "status.json", {"phase": "completed", "unbacked": False, "message": "Training and all checkpoint/final uploads completed"})
@@ -671,6 +800,9 @@ def launch(c, config):
                 return None
             if (Path(c["OUTPUT_DIR"]) / c["RUN_NAME"]).exists() and not c.get("RESUME"):
                 raise ValueError("Run already exists. Set explicit RESUME or choose a new RUN_NAME")
+            legacy_request = work / "dataset.legacy-request.json"
+            if (work / "dataset.sha256").is_file() and not (work / "dataset.identity.json").exists() and not legacy_request.exists():
+                atomic_json(legacy_request, {key: old.get(key) for key in ("DATASET_REPO", "DATASET_REVISION", "DATASET_FILE", "DATASET_FILES")})
         atomic_json(request, c)
         atomic_json(work / "status.json", {"phase": "starting"})
         with (work / "runner.log").open("a") as log:
